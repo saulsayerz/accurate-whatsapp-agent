@@ -22,6 +22,7 @@ def env(name: str, default: str | None = None) -> str:
 OPENAI_CLIENT = OpenAI(api_key=env("OPENAI_API_KEY", ""))
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 
+ACCURATE_ACCESS_TOKEN = os.getenv("ACCURATE_ACCESS_TOKEN", "")
 ACCURATE_CLIENT_ID = env("ACCURATE_CLIENT_ID")
 ACCURATE_CLIENT_SECRET = env("ACCURATE_CLIENT_SECRET")
 ACCURATE_REFRESH_TOKEN = env("ACCURATE_REFRESH_TOKEN")
@@ -32,7 +33,7 @@ DEFAULT_WAREHOUSE_NAME = env("DEFAULT_STOCK_WAREHOUSE_NAME", "Utama")
 
 class AccurateClient:
     def __init__(self) -> None:
-        self.access_token: str | None = None
+        self.access_token: str | None = ACCURATE_ACCESS_TOKEN or None
         self.session_id: str | None = None
         self.host: str | None = None
 
@@ -47,7 +48,11 @@ class AccurateClient:
             data={"grant_type": "refresh_token", "refresh_token": ACCURATE_REFRESH_TOKEN},
             timeout=30,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            body = response.text[:500]
+            raise RuntimeError(f"Accurate token refresh failed: {response.status_code} {body}") from exc
         data = response.json()
         self.access_token = data["access_token"]
         return str(self.access_token)
@@ -61,7 +66,19 @@ class AccurateClient:
             headers={"Authorization": f"Bearer {self.access_token}"},
             timeout=30,
         )
-        response.raise_for_status()
+        if response.status_code == 401 and ACCURATE_ACCESS_TOKEN and self.access_token == ACCURATE_ACCESS_TOKEN:
+            self.refresh_access_token()
+            response = requests.get(
+                f"{ACCURATE_ACCOUNT_BASE_URL}/api/open-db.do",
+                params={"id": ACCURATE_DB_ID},
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                timeout=30,
+            )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            body = response.text[:500]
+            raise RuntimeError(f"Accurate open-db failed: {response.status_code} {body}") from exc
         data = response.json()
         self.host = data["host"]
         self.session_id = data["session"]
@@ -129,10 +146,20 @@ def in_range(date_value: Any, start_iso: str, end_iso: str) -> bool:
 
 def list_items(term: str) -> list[dict[str, Any]]:
     client = AccurateClient()
-    data = client.api_get("/item/list.do", {"fields": "id,no,name,itemType", "sp.page": 1, "sp.pageSize": 100})
-    rows = data.get("d", [])
     term_lower = term.lower()
-    return [r for r in rows if term_lower in str(r.get("name", "")).lower() or term_lower == str(r.get("no", "")).lower()][:10]
+    matches: list[dict[str, Any]] = []
+    for page in range(1, 21):
+        data = client.api_get("/item/list.do", {"fields": "id,no,name,itemType", "sp.page": page, "sp.pageSize": 200})
+        rows = data.get("d", [])
+        for row in rows:
+            if term_lower in str(row.get("name", "")).lower() or term_lower == str(row.get("no", "")).lower():
+                matches.append(row)
+                if len(matches) >= 10:
+                    return matches
+        sp = data.get("sp") or {}
+        if page >= int(sp.get("pageCount") or 1):
+            break
+    return matches
 
 
 def get_item_stock(item_no: str, warehouse_name: str | None = None) -> dict[str, Any]:
