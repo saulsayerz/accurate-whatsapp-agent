@@ -3,6 +3,7 @@ import json
 import os
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -33,6 +34,7 @@ ACCURATE_REFRESH_TOKEN = env("ACCURATE_REFRESH_TOKEN", HARDCODED_ACCURATE_REFRES
 ACCURATE_DB_ID = env("ACCURATE_DB_ID")
 ACCURATE_ACCOUNT_BASE_URL = env("ACCURATE_ACCOUNT_BASE_URL", "https://account.accurate.id")
 DEFAULT_WAREHOUSE_NAME = env("DEFAULT_STOCK_WAREHOUSE_NAME", "Utama")
+ITEM_INDEX_PATH = Path(__file__).with_name("item_index.json")
 
 
 class AccurateClient:
@@ -156,6 +158,13 @@ def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def item_index() -> list[dict[str, Any]]:
+    try:
+        return json.loads(ITEM_INDEX_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
 def score_match(query: str, candidate: str) -> int:
     q = normalize_text(query)
     c = normalize_text(candidate)
@@ -186,8 +195,19 @@ def in_range(date_value: Any, start_iso: str, end_iso: str) -> bool:
 
 
 def list_items(term: str) -> list[dict[str, Any]]:
-    client = AccurateClient()
     term_lower = term.lower()
+    local_matches = []
+    for row in item_index():
+        name = str(row.get("name", ""))
+        no = str(row.get("no", ""))
+        score = max(score_match(term, name), 900 if term_lower == no.lower() else 0, score_match(term, no))
+        if score > 0:
+            local_matches.append((score, {"no": no, "name": name, "itemType": "INVENTORY"}))
+    if local_matches:
+        local_matches.sort(key=lambda x: (-x[0], str(x[1].get("name", ""))))
+        return [row for _, row in local_matches[:10]]
+
+    client = AccurateClient()
     scored: list[tuple[int, dict[str, Any]]] = []
     for page in range(1, 21):
         data = client.api_get("/item/list.do", {"fields": "id,no,name,itemType", "sp.page": page, "sp.pageSize": 200})
