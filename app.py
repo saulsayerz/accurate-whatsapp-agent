@@ -213,6 +213,42 @@ def get_item_by_code(item_no: str) -> dict[str, Any]:
     return {}
 
 
+def fast_path_response(user_message: str) -> str | None:
+    text = user_message.strip()
+    norm = normalize_text(text)
+
+    match_code_stock = re.search(r"(?:stok|stock).*(?:kode )?(\d{3,})", norm)
+    if match_code_stock:
+        code = match_code_stock.group(1)
+        stock = get_item_stock(code, DEFAULT_WAREHOUSE_NAME)
+        qty = float((stock.get("d") or {}).get("availableStock", 0) or 0)
+        item = get_item_by_code(code)
+        name = item.get("name") or f"kode {code}"
+        return f"Stok barang {name} di gudang {DEFAULT_WAREHOUSE_NAME} adalah {qty:.0f} unit."
+
+    match_code_name = re.search(r"nama barang.*(?:kode )?(\d{3,})", norm)
+    if match_code_name:
+        code = match_code_name.group(1)
+        item = get_item_by_code(code)
+        if item:
+            return f"Nama barang dengan kode {code} adalah {item.get('name')}."
+        return f"Barang dengan kode {code} tidak ditemukan."
+
+    if "stok barang" in norm or norm.startswith("berapa stok"):
+        query = re.sub(r"^(berapa stok barang|berapa stok|stok barang|stok)\s*", "", text, flags=re.IGNORECASE).strip()
+        if query:
+            matches = list_items(query)
+            if matches:
+                best = matches[0]
+                code = str(best.get("no", ""))
+                stock = get_item_stock(code, DEFAULT_WAREHOUSE_NAME)
+                qty = float((stock.get("d") or {}).get("availableStock", 0) or 0)
+                return f"Stok barang {best.get('name')} di gudang {DEFAULT_WAREHOUSE_NAME} adalah {qty:.0f} unit."
+            return f"Barang dengan nama {query} tidak ditemukan."
+
+    return None
+
+
 def get_item_stock(item_no: str, warehouse_name: str | None = None) -> dict[str, Any]:
     client = AccurateClient()
     params = {"no": item_no, "warehouseName": DEFAULT_WAREHOUSE_NAME}
@@ -582,6 +618,10 @@ When tool output is empty, clearly say data tidak ditemukan.
 
 
 def run_agent(user_message: str) -> str:
+    quick = fast_path_response(user_message)
+    if quick:
+        return quick
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
