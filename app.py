@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -22,8 +23,8 @@ def env(name: str, default: str | None = None) -> str:
 OPENAI_CLIENT = OpenAI(api_key=env("OPENAI_API_KEY", ""))
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 
-HARDCODED_ACCURATE_ACCESS_TOKEN = "729b63b2-fc86-4b84-9a02-ffc54fced186"
-HARDCODED_ACCURATE_REFRESH_TOKEN = "adb09ef1-99b7-4d1d-adb2-73c2c5e1516d"
+HARDCODED_ACCURATE_ACCESS_TOKEN = "2550cc28-6044-4dc1-ba29-b9746658c3b2"
+HARDCODED_ACCURATE_REFRESH_TOKEN = "30955b51-bace-42ca-ac8d-3753e4f4c96d"
 
 ACCURATE_ACCESS_TOKEN = os.getenv("ACCURATE_ACCESS_TOKEN", HARDCODED_ACCURATE_ACCESS_TOKEN)
 ACCURATE_CLIENT_ID = env("ACCURATE_CLIENT_ID")
@@ -149,6 +150,30 @@ def parse_date_safe(value: Any) -> date | None:
     return None
 
 
+def normalize_text(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def score_match(query: str, candidate: str) -> int:
+    q = normalize_text(query)
+    c = normalize_text(candidate)
+    if not q or not c:
+        return 0
+    if q == c:
+        return 1000
+    score = 0
+    if q in c:
+        score += 500
+    q_tokens = q.split()
+    c_tokens = set(c.split())
+    score += sum(100 for token in q_tokens if token in c_tokens)
+    if q.replace(" ", "") in c.replace(" ", ""):
+        score += 250
+    return score
+
+
 def in_range(date_value: Any, start_iso: str, end_iso: str) -> bool:
     d = parse_date_safe(date_value)
     if d is None:
@@ -163,19 +188,29 @@ def in_range(date_value: Any, start_iso: str, end_iso: str) -> bool:
 def list_items(term: str) -> list[dict[str, Any]]:
     client = AccurateClient()
     term_lower = term.lower()
-    matches: list[dict[str, Any]] = []
+    scored: list[tuple[int, dict[str, Any]]] = []
     for page in range(1, 21):
         data = client.api_get("/item/list.do", {"fields": "id,no,name,itemType", "sp.page": page, "sp.pageSize": 200})
         rows = data.get("d", [])
         for row in rows:
-            if term_lower in str(row.get("name", "")).lower() or term_lower == str(row.get("no", "")).lower():
-                matches.append(row)
-                if len(matches) >= 10:
-                    return matches
+            name = str(row.get("name", ""))
+            no = str(row.get("no", ""))
+            score = max(score_match(term, name), 900 if term_lower == no.lower() else 0, score_match(term, no))
+            if score > 0:
+                scored.append((score, row))
         sp = data.get("sp") or {}
         if page >= int(sp.get("pageCount") or 1):
             break
-    return matches
+    scored.sort(key=lambda x: (-x[0], str(x[1].get("name", ""))))
+    return [row for _, row in scored[:10]]
+
+
+def get_item_by_code(item_no: str) -> dict[str, Any]:
+    matches = list_items(item_no)
+    for row in matches:
+        if str(row.get("no", "")).lower() == str(item_no).lower():
+            return row
+    return {}
 
 
 def get_item_stock(item_no: str, warehouse_name: str | None = None) -> dict[str, Any]:
@@ -238,11 +273,11 @@ def list_low_stock_adv(limit: int = 10, threshold: float = 0, warehouse_name: st
 
 def customer_purchase_history(customer_name: str, date_range_text: str | None = None, limit: int = 10) -> dict[str, Any]:
     start, end = parse_relative_range(date_range_text)
-    invoices = get_sales_invoices().get("d", [])
+    invoices = collect_sales_details()
     name_lower = customer_name.lower()
     matched = []
     for row in invoices:
-        cust = str(row.get("customerName", "") or row.get("customer", "")).lower()
+        cust = str((row.get("customer") or {}).get("name", "") or row.get("customerName", "") or row.get("customer", "")).lower()
         if name_lower not in cust:
             continue
         trans_date = row.get("transDate") or row.get("invoiceDate")
@@ -252,7 +287,7 @@ def customer_purchase_history(customer_name: str, date_range_text: str | None = 
             {
                 "number": row.get("number") or row.get("invoiceNo"),
                 "transDate": trans_date,
-                "customerName": row.get("customerName") or row.get("customer"),
+                "customerName": (row.get("customer") or {}).get("name") or row.get("customerName") or row.get("customer"),
                 "totalAmount": row.get("totalAmount") or row.get("amount") or 0,
                 "outstandingAmount": row.get("outstandingAmount") or row.get("balance") or 0,
             }
@@ -262,7 +297,7 @@ def customer_purchase_history(customer_name: str, date_range_text: str | None = 
 
 def sales_summary(date_range_text: str | None = None, limit: int = 10) -> dict[str, Any]:
     start, end = parse_relative_range(date_range_text)
-    invoices = get_sales_invoices().get("d", [])
+    invoices = collect_sales_details()
     rows = []
     total = 0.0
     for row in invoices:
@@ -274,7 +309,7 @@ def sales_summary(date_range_text: str | None = None, limit: int = 10) -> dict[s
         rows.append({
             "number": row.get("number") or row.get("invoiceNo"),
             "transDate": trans_date,
-            "customerName": row.get("customerName") or row.get("customer"),
+            "customerName": (row.get("customer") or {}).get("name") or row.get("customerName") or row.get("customer"),
             "totalAmount": amount,
         })
     rows.sort(key=lambda x: x.get("transDate") or "", reverse=True)
@@ -283,14 +318,14 @@ def sales_summary(date_range_text: str | None = None, limit: int = 10) -> dict[s
 
 def piutang_due_list(date_range_text: str | None = None, customer_name: str | None = None, limit: int = 10) -> dict[str, Any]:
     start, end = parse_relative_range(date_range_text)
-    invoices = get_sales_invoices().get("d", [])
+    invoices = collect_sales_details()
     name_lower = (customer_name or "").lower().strip()
     rows = []
     for row in invoices:
-        outstanding = float(row.get("outstandingAmount", 0) or row.get("balance", 0) or 0)
-        if outstanding <= 0:
+        outstanding = float(row.get("primeOwing", 0) or row.get("outstandingAmount", 0) or row.get("balance", 0) or 0)
+        if not bool(row.get("outstanding")) or outstanding <= 0:
             continue
-        cust = str(row.get("customerName", "") or row.get("customer", ""))
+        cust = str((row.get("customer") or {}).get("name", "") or row.get("customerName", "") or row.get("customer", ""))
         if name_lower and name_lower not in cust.lower():
             continue
         due_date = row.get("dueDate") or row.get("maturityDate") or row.get("transDate")
@@ -308,14 +343,14 @@ def piutang_due_list(date_range_text: str | None = None, customer_name: str | No
 
 def hutang_due_list(date_range_text: str | None = None, supplier_name: str | None = None, limit: int = 10) -> dict[str, Any]:
     start, end = parse_relative_range(date_range_text)
-    invoices = get_purchase_invoices().get("d", [])
+    invoices = collect_purchase_details()
     name_lower = (supplier_name or "").lower().strip()
     rows = []
     for row in invoices:
-        outstanding = float(row.get("outstandingAmount", 0) or row.get("balance", 0) or 0)
-        if outstanding <= 0:
+        outstanding = float(row.get("primeOwing", 0) or row.get("outstandingAmount", 0) or row.get("balance", 0) or 0)
+        if not bool(row.get("outstanding")) or outstanding <= 0:
             continue
-        vendor = str(row.get("vendorName", "") or row.get("supplierName", "") or row.get("vendor", ""))
+        vendor = str((row.get("vendor") or {}).get("name", "") or row.get("vendorName", "") or row.get("supplierName", "") or row.get("vendor", ""))
         if name_lower and name_lower not in vendor.lower():
             continue
         due_date = row.get("dueDate") or row.get("maturityDate") or row.get("transDate")
@@ -342,6 +377,14 @@ TOOLS = [
                 "properties": {"query": {"type": "string"}},
                 "required": ["query"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_item_by_code",
+            "description": "Get item master data by exact item code.",
+            "parameters": {"type": "object", "properties": {"item_no": {"type": "string"}}, "required": ["item_no"]},
         },
     },
     {
@@ -491,6 +534,8 @@ TOOLS = [
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "find_item":
         return {"matches": list_items(arguments["query"])}
+    if name == "get_item_by_code":
+        return get_item_by_code(arguments["item_no"])
     if name == "get_item_stock":
         return get_item_stock(arguments["item_no"], arguments.get("warehouse_name") or DEFAULT_WAREHOUSE_NAME)
     if name == "get_sell_price":
@@ -507,15 +552,15 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return sales_summary(arguments.get("date_range_text"), int(arguments.get("limit") or 10))
     if name == "get_piutang_summary":
         start, end = parse_relative_range(arguments.get("date_range_text"))
-        data = get_sales_invoices().get("d", [])
-        unpaid = [row for row in data if float(row.get("outstandingAmount", 0) or row.get("balance", 0) or 0) > 0]
-        total = sum(float(row.get("outstandingAmount", 0) or 0) for row in unpaid)
+        data = collect_sales_details()
+        unpaid = [row for row in data if bool(row.get("outstanding")) and float(row.get("primeOwing", 0) or row.get("outstandingAmount", 0) or row.get("balance", 0) or 0) > 0 and in_range(row.get("dueDate") or row.get("transDate"), start, end)]
+        total = sum(float(row.get("primeOwing", 0) or row.get("outstandingAmount", 0) or 0) for row in unpaid)
         return {"from_date": start, "to_date": end, "count": len(unpaid), "total_outstanding": total}
     if name == "get_hutang_summary":
         start, end = parse_relative_range(arguments.get("date_range_text"))
-        data = get_purchase_invoices().get("d", [])
-        unpaid = [row for row in data if float(row.get("outstandingAmount", 0) or row.get("balance", 0) or 0) > 0]
-        total = sum(float(row.get("outstandingAmount", 0) or 0) for row in unpaid)
+        data = collect_purchase_details()
+        unpaid = [row for row in data if bool(row.get("outstanding")) and float(row.get("primeOwing", 0) or row.get("outstandingAmount", 0) or row.get("balance", 0) or 0) > 0 and in_range(row.get("dueDate") or row.get("transDate"), start, end)]
+        total = sum(float(row.get("primeOwing", 0) or row.get("outstandingAmount", 0) or 0) for row in unpaid)
         return {"from_date": start, "to_date": end, "count": len(unpaid), "total_outstanding": total}
     if name == "piutang_due_list":
         return piutang_due_list(arguments.get("date_range_text"), arguments.get("customer_name"), int(arguments.get("limit") or 10))
@@ -600,3 +645,39 @@ def twilio_whatsapp() -> Response:
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+def get_sales_invoice_detail(invoice_id: int) -> dict[str, Any]:
+    client = AccurateClient()
+    return client.api_get("/sales-invoice/detail.do", {"id": invoice_id}).get("d", {})
+
+
+def get_purchase_invoice_detail(invoice_id: int) -> dict[str, Any]:
+    client = AccurateClient()
+    return client.api_get("/purchase-invoice/detail.do", {"id": invoice_id}).get("d", {})
+
+
+def collect_sales_details(limit_pages: int = 5) -> list[dict[str, Any]]:
+    details = []
+    client = AccurateClient()
+    for page in range(1, limit_pages + 1):
+        data = client.api_get("/sales-invoice/list.do", {"sp.page": page, "sp.pageSize": 100})
+        for row in data.get("d", []):
+            if row.get("id") is not None:
+                details.append(get_sales_invoice_detail(int(row["id"])))
+        sp = data.get("sp") or {}
+        if page >= int(sp.get("pageCount") or 1):
+            break
+    return details
+
+
+def collect_purchase_details(limit_pages: int = 5) -> list[dict[str, Any]]:
+    details = []
+    client = AccurateClient()
+    for page in range(1, limit_pages + 1):
+        data = client.api_get("/purchase-invoice/list.do", {"sp.page": page, "sp.pageSize": 100})
+        for row in data.get("d", []):
+            if row.get("id") is not None:
+                details.append(get_purchase_invoice_detail(int(row["id"])))
+        sp = data.get("sp") or {}
+        if page >= int(sp.get("pageCount") or 1):
+            break
+    return details
