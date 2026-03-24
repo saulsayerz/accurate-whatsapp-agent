@@ -22,10 +22,13 @@ def env(name: str, default: str | None = None) -> str:
 OPENAI_CLIENT = OpenAI(api_key=env("OPENAI_API_KEY", ""))
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 
-ACCURATE_ACCESS_TOKEN = os.getenv("ACCURATE_ACCESS_TOKEN", "")
+HARDCODED_ACCURATE_ACCESS_TOKEN = "729b63b2-fc86-4b84-9a02-ffc54fced186"
+HARDCODED_ACCURATE_REFRESH_TOKEN = "adb09ef1-99b7-4d1d-adb2-73c2c5e1516d"
+
+ACCURATE_ACCESS_TOKEN = os.getenv("ACCURATE_ACCESS_TOKEN", HARDCODED_ACCURATE_ACCESS_TOKEN)
 ACCURATE_CLIENT_ID = env("ACCURATE_CLIENT_ID")
 ACCURATE_CLIENT_SECRET = env("ACCURATE_CLIENT_SECRET")
-ACCURATE_REFRESH_TOKEN = env("ACCURATE_REFRESH_TOKEN")
+ACCURATE_REFRESH_TOKEN = env("ACCURATE_REFRESH_TOKEN", HARDCODED_ACCURATE_REFRESH_TOKEN)
 ACCURATE_DB_ID = env("ACCURATE_DB_ID")
 ACCURATE_ACCOUNT_BASE_URL = env("ACCURATE_ACCOUNT_BASE_URL", "https://account.accurate.id")
 DEFAULT_WAREHOUSE_NAME = env("DEFAULT_STOCK_WAREHOUSE_NAME", "Utama")
@@ -33,7 +36,7 @@ DEFAULT_WAREHOUSE_NAME = env("DEFAULT_STOCK_WAREHOUSE_NAME", "Utama")
 
 class AccurateClient:
     def __init__(self) -> None:
-        self.access_token: str | None = ACCURATE_ACCESS_TOKEN or None
+        self.access_token: str | None = ACCURATE_ACCESS_TOKEN or HARDCODED_ACCURATE_ACCESS_TOKEN or None
         self.session_id: str | None = None
         self.host: str | None = None
 
@@ -85,7 +88,6 @@ class AccurateClient:
 
     def api_get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.host or not self.session_id or not self.access_token:
-            self.refresh_access_token()
             self.open_db()
         response = requests.get(
             f"{self.host}/accurate/api{path}",
@@ -96,6 +98,20 @@ class AccurateClient:
             },
             timeout=60,
         )
+        if response.status_code == 401:
+            self.host = None
+            self.session_id = None
+            self.refresh_access_token()
+            self.open_db()
+            response = requests.get(
+                f"{self.host}/accurate/api{path}",
+                params=params or {},
+                headers={
+                    "Authorization": f"Bearer {self.access_token}",
+                    "X-Session-ID": self.session_id,
+                },
+                timeout=60,
+            )
         response.raise_for_status()
         return response.json()
 
