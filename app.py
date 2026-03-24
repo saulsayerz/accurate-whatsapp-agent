@@ -3,12 +3,12 @@ import json
 import os
 import re
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import requests
 from flask import Flask, Response, request
-from openai import OpenAI
 
 
 app = Flask(__name__)
@@ -21,7 +21,7 @@ def env(name: str, default: str | None = None) -> str:
     return value
 
 
-OPENAI_CLIENT = OpenAI(api_key=env("OPENAI_API_KEY", ""))
+OPENAI_API_KEY = env("OPENAI_API_KEY", "")
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 
 HARDCODED_ACCURATE_ACCESS_TOKEN = "2550cc28-6044-4dc1-ba29-b9746658c3b2"
@@ -158,6 +158,14 @@ def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+@lru_cache(maxsize=1)
+def get_openai_client():
+    from openai import OpenAI
+
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+@lru_cache(maxsize=1)
 def item_index() -> list[dict[str, Any]]:
     try:
         return json.loads(ITEM_INDEX_PATH.read_text(encoding="utf-8"))
@@ -648,7 +656,7 @@ def run_agent(user_message: str) -> str:
     ]
 
     for _ in range(6):
-        response = OPENAI_CLIENT.chat.completions.create(
+        response = get_openai_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             tools=TOOLS,
